@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# jsp-slot - run a heavy command only when a slot for its kind is free and the machine has headroom.
+usage() {
+  cat <<'USAGE'
+Usage:
+  jsp-slot <kind> -- <command...>   wait for a free slot, run the command, always release
+  jsp-slot status                   list slots (kind, index, owner pid, state, age)
+
+Slots per kind come from heavyJobs.<kind>.slots in the project config (default 1).
+Slot = directory ${JSP_SLOT_DIR:-/tmp}/jsp-slot-<kind>-<i> created with an atomic mkdir
+and holding the owner pid; slots whose owner died are reclaimed. While every slot is busy
+or `machine-budget` says wait, a message is printed every 30 s. JSP_POLL (default 2)
+sets the poll interval in seconds. The command's exit code is returned.
+USAGE
+}
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+BASE="${JSP_SLOT_DIR:-/tmp}"
+POLL="${JSP_POLL:-2}"
+
+slot_state() { # <dir> -> prints "free|busy|stale"
+  local d="$1" pid
+  [ -d "$d" ] || { echo free; return; }
+  pid="$(cat "$d/pid" 2>/dev/null || true)"
+  if [ -z "$pid" ]; then # owner may be between mkdir and writing its pid
+    if [ -n "$(find "$d" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then echo stale; else echo busy; fi
+  elif kill -0 "$pid" 2>/dev/null; then echo busy
+  else echo stale
+  fi
+}
+
+status() {
+  local d found=0 name kind idx pid st age
+  for d in "$BASE"/jsp-slot-*-*; do
+    [ -d "$d" ] || continue
+    case "$d" in *.stale.*) continue ;; esac
+    found=1
+    name="${d##*/jsp-slot-}"; kind="${name%-*}"; idx="${name##*-}"
+    st="$(slot_state "$d")"; pid="$(cat "$d/pid" 2>/dev/null || echo -)"
+    age=$(( ( $(date +%s) - $(cat "$d/started" 2>/dev/null || date +%s) ) / 60 ))
+    printf '%-16s slot %-3s pid %-8s %-6s %s min  %s\n' "$kind" "$idx" "$pid" "$st" "$age" "$(cat "$d/cmd" 2>/dev/null || true)"
+  done
+  [ "$found" = 1 ] || echo "no slots in use"
+}
+
+try_acquire() { # <kind> <n> -> prints slot dir on success
+  local kind="$1" n="$2" i d
+  for i in $(seq 1 "$n"); do
+    d="$BASE/jsp-slot-$kind-$i"
+    if [ "$(slot_state "$d")" = stale ] && mv "$d" "$d.stale.$$" 2>/dev/null; then
+      # only one reclaimer wins the rename; put the dir back if someone refilled it meanwhile
+      if [ "$(slot_state "$d.stale.$$")" = stale ]; then rm -rf "$d.stale.$$"; else mv "$d.stale.$$" "$d" 2>/dev/null || true; fi
+    fi
+    if mkdir "$d" 2>/dev/null; then
+      echo "$$" > "$d/pid"; date +%s > "$d/started"; basename "$CMD0" > "$d/cmd"
+      echo "$d"; return 0
+    fi
+  done
+  return 1
+}
+
+case "${1:-}" in
+  -h|--help|"") usage; [ -n "${1:-}" ] && exit 0 || exit 2 ;;
+  status) status; exit 0 ;;
+esac
+
+KIND="$1"; shift
+case "$KIND" in *[!A-Za-z0-9._]*|"") echo "jsp-slot: invalid kind '$KIND'" >&2; exit 2 ;; esac
+[ "${1:-}" = "--" ] && shift
+[ $# -gt 0 ] || { echo "jsp-slot: missing command" >&2; usage >&2; exit 2; }
+CMD0="$1"
+
+N="$("$HERE/jsp-config" get "heavyJobs.$KIND.slots" 1)"
+case "$N" in *[!0-9]*|"") N=1 ;; esac
+[ "$N" -ge 1 ] || N=1
+
+SLOT=""; CHILD=""
+# shellcheck disable=SC2329  # invoked via trap
+release() { [ -n "$SLOT" ] && rm -rf "$SLOT"; SLOT=""; return 0; }
+trap 'release' EXIT
+trap '[ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null; exit 143' INT TERM HUP
+
+waited=0; last_msg=0
+while :; do
+  reason=""
+  "$HERE/machine-budget" >/dev/null 2>&1 && brc=0 || brc=$?
+  [ "$brc" = 3 ] && reason="machine busy (see machine-budget)"
+  if [ -z "$reason" ]; then
+    if SLOT="$(try_acquire "$KIND" "$N")"; then break; fi
+    SLOT=""; reason="all $N '$KIND' slot(s) busy"
+  fi
+  if [ $((waited - last_msg)) -ge 30 ] || [ "$waited" = 0 ]; then
+    echo "jsp-slot: waiting ($reason), ${waited}s so far" >&2; last_msg=$waited
+  fi
+  sleep "$POLL"; waited=$((waited + POLL))
+done
+
+[ "$waited" = 0 ] || echo "jsp-slot: slot acquired after ${waited}s" >&2
+exec 3<&0
+set +e
+"$@" <&3 &
+CHILD=$!
+wait "$CHILD"; rc=$?
+while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; rc=$?; done
+CHILD=""
+exit "$rc"

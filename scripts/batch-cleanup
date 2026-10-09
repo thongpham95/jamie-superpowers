@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""batch-cleanup - remove what a finished batch of work leaves behind.
+
+Usage: batch-cleanup [--apply]        (dry run unless --apply)
+
+Per repo (config `repos`, default: project root + child git repos):
+  - linked worktrees that are clean (no changes, no untracked files) and whose HEAD is
+    merged into the default branch (origin/HEAD, else main/master): `git worktree remove`
+    (never --force), then `git branch -d` of its branch (never -D).
+Only what the project config lists is touched beyond that:
+  - cleanup.dockerImages   globs on repo:tag; images used by no container -> docker rmi
+  - cleanup.dockerVolumes  globs; dangling volumes only -> docker volume rm
+  - cleanup.tmpGlobs       absolute globs; paths owned by the current user
+Prints REMOVE / WOULD REMOVE / KEEP <thing>: <reason> lines, then the disk freed and the
+free disk. Docker steps are skipped when the CLI or daemon is unavailable.
+"""
+import fnmatch
+import glob
+import os
+import shutil
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+GB = 1024.0 ** 3
+freed = 0
+FRESH_MINUTES = 60  # skip worktrees modified this recently: an agent may be starting in them
+
+
+def say(kind, what, why=""):
+    print(("%s %s" % (kind, what)) + (": " + why if why else ""))
+
+
+def last_line(text, fallback="failed"):
+    lines = text.strip().splitlines()
+    return lines[-1] if lines else fallback
+
+
+def du(path):
+    """Size in bytes of a file or tree (0 on error)."""
+    total = 0
+    try:
+        if os.path.islink(path) or os.path.isfile(path):
+            return os.lstat(path).st_size
+        for d, _, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(d, f)).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def default_branch(repo):
+    """(ref list to test 'merged into', label) or (None, None)."""
+    refs = []
+    head = J.git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if head:
+        refs.append(head)
+    for b in ("main", "master"):
+        if J.git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/" + b):
+            refs.append(b)
+            break
+    return refs
+
+
+def parse_worktrees(repo):
+    out = J.git(repo, "worktree", "list", "--porcelain") or ""
+    items, cur = [], {}
+    for line in out.splitlines() + [""]:
+        if not line:
+            if cur:
+                items.append(cur)
+            cur = {}
+            continue
+        k, _, v = line.partition(" ")
+        cur[k] = v or True
+    return items
+
+
+def cleanup_worktrees(repo, apply, cwd):
+    global freed
+    refs = default_branch(repo)
+    wts = parse_worktrees(repo)
+    for wt in wts[1:]:  # the first entry is the main working tree
+        path, head = wt.get("worktree"), wt.get("HEAD")
+        branch = wt.get("branch", "").replace("refs/heads/", "")
+        label = "worktree %s%s" % (path, " [%s]" % branch if branch else "")
+        if wt.get("bare") or wt.get("locked") or wt.get("prunable"):
+            say("KEEP", label, "locked/prunable (inspect manually, git worktree prune)")
+        elif cwd == path or cwd.startswith(path + os.sep):
+            say("KEEP", label, "current directory is inside it")
+        elif not refs:
+            say("KEEP", label, "no default branch found (origin/HEAD, main, master)")
+        elif time.time() - os.path.getmtime(path) < FRESH_MINUTES * 60:
+            say("KEEP", label, "created or touched < %d min ago (an agent may be starting in it)" % FRESH_MINUTES)
+        elif J.git(path, "status", "--porcelain") != "":
+            say("KEEP", label, "uncommitted or untracked changes")
+        elif not any(J.run(["git", "-C", repo, "merge-base", "--is-ancestor", head, r])[0] == 0 for r in refs):
+            say("KEEP", label, "HEAD not merged into %s" % refs[0])
+        else:
+            size = du(path)
+            if not apply:
+                say("WOULD REMOVE", label)
+                freed += size
+                continue
+            rc, _, err = J.run(["git", "-C", repo, "worktree", "remove", path])
+            if rc != 0:
+                say("KEEP", label, "git worktree remove refused: " + last_line(err))
+                continue
+            freed += size
+            say("REMOVED", label)
+            if branch and branch not in ("main", "master"):
+                rc, _, err = J.run(["git", "-C", repo, "branch", "-d", branch])
+                say("REMOVED" if rc == 0 else "KEEP", "branch " + branch, "" if rc == 0 else last_line(err))
+    if len(wts) <= 1:
+        say("KEEP", "repo %s" % repo, "no linked worktrees")
+
+
+def docker_ok():
+    if not shutil.which("docker"):
+        return False
+    rc, _, _ = J.run(["docker", "info", "--format", "{{.ID}}"], timeout=8)
+    return rc == 0
+
+
+def matches(name, globs):
+    return any(fnmatch.fnmatchcase(name, g) for g in globs)
+
+
+def cleanup_docker(cfg, apply):
+    global freed
+    img_globs, vol_globs = cfg["cleanup"]["dockerImages"], cfg["cleanup"]["dockerVolumes"]
+    if not (img_globs or vol_globs):
+        return
+    if not docker_ok():
+        say("KEEP", "docker", "CLI missing or daemon not running; skipped")
+        return
+    if img_globs:
+        _, ids, _ = J.run(["docker", "ps", "-aq"])
+        used = set()
+        if ids.split():
+            _, ins, _ = J.run(["docker", "inspect", "-f", "{{.Image}}"] + ids.split())
+            used = set(ins.split())
+        _, listing, _ = J.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}"])
+        for line in listing.splitlines():
+            ref, _, short = line.partition("\t")
+            if not matches(ref, img_globs):
+                continue
+            _, full, _ = J.run(["docker", "image", "inspect", "-f", "{{.Id}}\t{{.Size}}", ref])
+            full_id, _, size = full.strip().partition("\t")
+            if full_id in used:
+                say("KEEP", "docker image " + ref, "used by a container")
+            elif not apply:
+                say("WOULD REMOVE", "docker image " + ref)
+                freed += int(size or 0)
+            else:
+                rc, _, err = J.run(["docker", "rmi", short if "<none>" in ref else ref])  # untagged: by id
+                say("REMOVED" if rc == 0 else "KEEP", "docker image " + ref, "" if rc == 0 else last_line(err))
+                freed += int(size or 0) if rc == 0 else 0
+    if vol_globs:
+        _, dangling, _ = J.run(["docker", "volume", "ls", "-q", "-f", "dangling=true"])
+        _, allvols, _ = J.run(["docker", "volume", "ls", "-q"])
+        live = set(dangling.split())
+        for v in allvols.split():
+            if not matches(v, vol_globs):
+                continue
+            if v not in live:
+                say("KEEP", "docker volume " + v, "in use (not dangling)")
+            elif not apply:
+                say("WOULD REMOVE", "docker volume " + v, "size not counted")
+            else:
+                rc, _, err = J.run(["docker", "volume", "rm", v])
+                say("REMOVED" if rc == 0 else "KEEP", "docker volume " + v, "" if rc == 0 else last_line(err))
+
+
+def cleanup_tmp(cfg, apply, cwd):
+    global freed
+    home, uid = os.path.expanduser("~"), os.geteuid()
+    for pattern in cfg["cleanup"]["tmpGlobs"]:
+        pattern = os.path.expanduser(pattern)
+        if not os.path.isabs(pattern):
+            say("KEEP", "tmp glob " + pattern, "not an absolute path")
+            continue
+        for p in sorted(glob.glob(pattern)):
+            real = os.path.realpath(p)
+            if p in ("/", "/tmp", home) or cwd == real or cwd.startswith(real + os.sep) or home.startswith(real + os.sep):
+                say("KEEP", p, "protected (root, home, tmp or an ancestor of the current directory)")
+            elif os.lstat(p).st_uid != uid:
+                say("KEEP", p, "not owned by current user")
+            elif not apply:
+                say("WOULD REMOVE", p)
+                freed += du(p)
+            else:
+                size = du(p)
+                try:
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p)
+                    else:
+                        os.unlink(p)
+                    freed += size
+                    say("REMOVED", p)
+                except OSError as e:
+                    say("KEEP", p, str(e))
+
+
+def main(argv):
+    if J.wants_help(argv):
+        print(__doc__.strip())
+        return 0
+    apply = "--apply" in argv
+    cwd = os.path.realpath(os.getcwd())
+    root = J.project_root()
+    try:
+        cfg = J.load_config(root)
+    except J.ConfigError as e:
+        J.die(str(e))
+    print("batch-cleanup (%s) in %s" % ("APPLY" if apply else "dry run, nothing removed", root))
+    if not os.path.isfile(J.config_path(root)):
+        say("KEEP", "docker/tmp", "no project config: only merged clean worktrees are considered")
+    for repo in J.repo_paths(root, cfg):
+        if not os.path.exists(os.path.join(repo, ".git")):
+            say("KEEP", "repo " + repo, "not a git repository")
+            continue
+        cleanup_worktrees(repo, apply, cwd)
+    cleanup_docker(cfg, apply)
+    cleanup_tmp(cfg, apply, cwd)
+    print("%s: %.2f GB (%d MB)" % ("Freed" if apply else "Would free", freed / GB, freed // 1048576))
+    print("Free disk: %.1f GB" % (shutil.disk_usage(root).free / GB))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

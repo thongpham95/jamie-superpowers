@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# session-start hook: thin launcher for session_start.py (never fails the session / compaction).
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+command -v python3 >/dev/null 2>&1 || exit 0
+python3 "$HERE/session_start.py" || true
+exit 0

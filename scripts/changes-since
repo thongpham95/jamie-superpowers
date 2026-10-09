@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""changes-since - markdown changelog skeleton from git history.
+
+Usage: changes-since <ref> [--repo <dir>] [--to <ref>]
+
+Lists non-merge commits in <ref>..<to> (default HEAD) of the repo (default: current
+directory) and buckets them by conventional-commit type, falling back to keywords:
+  feat -> New   fix -> Fixes   chore/ci/build/refactor/perf -> Infra   rest -> Other
+Breaking changes (type! or "BREAKING CHANGE") are also repeated under Warnings.
+Output is a markdown skeleton with emoji section headers and short shas, in English; the
+caller translates it and fills the Warnings / How to test / Links sections.
+"""
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+INFRA = ("chore", "ci", "build", "refactor", "perf")
+KEYWORDS = [
+    ("fixes", re.compile(r"\b(fix|fixes|fixed|bug|crash|hotfix|regression)\b", re.I)),
+    ("new", re.compile(r"\b(add|adds|added|implement|introduce|support|new)\b", re.I)),
+    ("infra", re.compile(r"\b(bump|upgrade|deps?|dependency|cleanup|rename|lint|pipeline|release)\b", re.I)),
+]
+CC = re.compile(r"^(\w+)(\([^)]*\))?(!)?:\s*(.*)$")
+
+
+def bucket(subject, body):
+    m = CC.match(subject)
+    breaking = bool(m and m.group(3)) or "BREAKING CHANGE" in body
+    if m:
+        kind, text = m.group(1).lower(), m.group(4)
+        if kind in ("feat", "feature"):
+            return "new", text, breaking
+        if kind in ("fix", "bugfix", "hotfix"):
+            return "fixes", text, breaking
+        if kind in INFRA:
+            return "infra", text, breaking
+    for name, rx in KEYWORDS:
+        if rx.search(subject):
+            return name, subject, breaking
+    return "other", subject, breaking
+
+
+def main(argv):
+    if not argv or J.wants_help(argv):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    repo, to, ref = ".", "HEAD", None
+    it = iter(argv)
+    for a in it:
+        if a == "--repo":
+            repo = next(it, ".")
+        elif a == "--to":
+            to = next(it, "HEAD")
+        elif ref is None:
+            ref = a
+    if not ref:
+        J.die("usage: changes-since <ref> [--repo <dir>]")
+    rc, out, err = J.run(["git", "-C", repo, "log", "--no-merges", "--reverse",
+                          "--pretty=format:%h%x1f%s%x1f%b%x1e", "%s..%s" % (ref, to)])
+    if rc != 0:
+        J.die("git log failed: %s" % err.strip())
+    buckets = {"new": [], "fixes": [], "infra": [], "other": []}
+    warnings = []
+    for rec in out.split("\x1e"):
+        rec = rec.strip("\n")
+        if not rec:
+            continue
+        sha, subject, body = (rec.split("\x1f") + ["", ""])[:3]
+        name, text, breaking = bucket(subject.strip(), body)
+        line = "- %s (%s)" % (text, sha.strip())
+        buckets[name].append(line)
+        if breaking:
+            warnings.append(line)
+    total = sum(len(v) for v in buckets.values())
+    print("# 🚀 Changes %s..%s (%d commits)\n" % (ref, to, total))
+    for title, key in (("✨ New", "new"), ("🐛 Fixes", "fixes"), ("🔧 Infra", "infra"), ("Other", "other")):
+        if buckets[key]:
+            print("## %s\n" % title)
+            print("\n".join(buckets[key]) + "\n")
+    print("## ⚠️ Warnings\n")
+    print(("\n".join(warnings) if warnings else "- (none detected; add known issues or migration steps here)") + "\n")
+    print("## 🧪 How to test\n\n- (steps)\n")
+    print("## 🔗 Links\n\n- (build / release / ticket links)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

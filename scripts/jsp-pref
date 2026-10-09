@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""jsp-pref - per-user jamie-superpowers preferences.
+
+Usage:
+  jsp-pref get <key>            print the value; prints nothing and exits 1 if unset
+  jsp-pref set <key> <value>    store (numbers/true/false/JSON are parsed, else a string)
+  jsp-pref unset <key>          remove the key
+  jsp-pref list                 print all preferences as JSON
+
+Keys may be dotted (e.g. statusline.yellow). Storage:
+  ${JSP_HOME:-$HOME/.claude/jamie-superpowers}/prefs.json
+Common keys: language, statusline.yellow, statusline.red.
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+
+def main(argv):
+    if not argv or J.wants_help(argv):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    prefs = J.load_prefs()
+    if cmd == "list":
+        print(json.dumps(prefs, indent=2, ensure_ascii=False))
+        return 0
+    if cmd not in ("get", "set", "unset") or not rest:
+        J.die("usage: jsp-pref get|set|unset <key> [value]  (see --help)")
+    key = rest[0]
+    if cmd == "get":
+        found, value = J.dotted_get(prefs, key)
+        if not found or value is None:
+            return 1
+        print(J.fmt(value))
+        return 0
+    parts = key.split(".")
+    parent = prefs
+    for p in parts[:-1]:
+        nxt = parent.get(p)
+        if not isinstance(nxt, dict):
+            if cmd == "unset":
+                return 0
+            nxt = parent[p] = {}
+        parent = nxt
+    if cmd == "set":
+        if len(rest) < 2:
+            J.die("usage: jsp-pref set <key> <value>")
+        raw = rest[1]
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+        parent[parts[-1]] = value
+    else:
+        parent.pop(parts[-1], None)
+    J.save_prefs(prefs)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,21 @@
+{
+  "name": "jamie-superpowers",
+  "version": "0.1.0",
+  "description": "Superpowers fork with resource-aware parallel agents, cache-aware dispatch, batch cleanup, deploy changelogs and context keeping",
+  "author": {
+    "name": "Jamie"
+  },
+  "homepage": "https://github.com/thongpham95/jamie-superpowers",
+  "repository": "https://github.com/thongpham95/jamie-superpowers",
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "workflow",
+    "parallel-agents",
+    "worktrees",
+    "context-management",
+    "cleanup",
+    "changelog",
+    "tdd"
+  ]
+}

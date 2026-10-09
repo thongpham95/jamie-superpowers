@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""machine-budget - how much parallel work can this machine take right now?
+
+Usage: machine-budget [--json]
+
+Prints cores, RAM (total/available), load averages, free disk on the project
+volume, and running processes per `heavyJobs` kind from the project config
+(matched by command-line substring). Last line:
+
+  VERDICT: ok max_heavy=<n> max_agents=<n>
+  VERDICT: wait reason=<load,ram,disk>          (exit 3)
+
+wait when load1 > loadFactor x cores, available RAM < 1.5 GB or free disk < 10 GB.
+max_agents = max(1, min(cores/2, total RAM GB/4)); max_heavy = max(1, min(cores/4,
+available RAM GB/3)). Exit codes: 0 ok, 3 wait.
+"""
+import json
+import os
+import re
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+GB = 1024.0 ** 3
+MIN_RAM_GB, MIN_DISK_GB = 1.5, 10.0
+
+
+def memory():
+    """(total_bytes, available_bytes) on Linux and macOS."""
+    try:
+        with open("/proc/meminfo") as f:
+            kb = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
+        return kb["MemTotal"] * 1024, kb.get("MemAvailable", kb.get("MemFree", 0)) * 1024
+    except (OSError, KeyError, ValueError):
+        pass
+    _, out, _ = J.run(["sysctl", "-n", "hw.memsize"])
+    total = int(out.strip() or 0)
+    _, vm, _ = J.run(["vm_stat"])
+    m = re.search(r"page size of (\d+) bytes", vm)
+    page = int(m.group(1)) if m else 4096
+    pages = {k: int(v) for k, v in re.findall(r"Pages (free|inactive|speculative):\s+(\d+)", vm)}
+    return total, sum(pages.values()) * page
+
+
+def process_lines():
+    _, out, _ = J.run(["ps", "-axo", "pid=,args="])
+    me = {os.getpid(), os.getppid()}
+    rows = []
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) not in me and "machine-budget" not in args and "jsp-slot" not in args:
+            rows.append(args)
+    return rows
+
+
+def main(argv):
+    if J.wants_help(argv):
+        print(__doc__.strip())
+        return 0
+    root = J.project_root()
+    cfg = J.load_config_safe(root)
+    cores = os.cpu_count() or 1
+    total, avail = memory()
+    load = os.getloadavg()
+    disk = shutil.disk_usage(root).free
+    procs = process_lines()
+    heavy = {}
+    for kind, spec in sorted(cfg["heavyJobs"].items()):
+        pats = [p for p in spec.get("match", []) if p]
+        n = sum(1 for a in procs if any(p in a for p in pats))
+        heavy[kind] = {"running": n, "slots": int(spec.get("slots", 1))}
+
+    reasons = []
+    if load[0] > float(cfg["loadFactor"]) * cores:
+        reasons.append("load")
+    if avail / GB < MIN_RAM_GB:
+        reasons.append("ram")
+    if disk / GB < MIN_DISK_GB:
+        reasons.append("disk")
+    max_agents = max(1, int(min(cores / 2, total / GB / 4)))
+    max_heavy = max(1, int(min(cores / 4, avail / GB / 3)))
+    verdict = "wait" if reasons else "ok"
+
+    if "--json" in argv:
+        print(json.dumps({
+            "cores": cores, "ram_total_gb": round(total / GB, 1), "ram_available_gb": round(avail / GB, 1),
+            "load": [round(x, 2) for x in load], "disk_free_gb": round(disk / GB, 1), "heavy": heavy,
+            "verdict": verdict, "reasons": reasons, "max_heavy": max_heavy, "max_agents": max_agents,
+        }, indent=2))
+    else:
+        print("cores: %d" % cores)
+        print("ram: %.1f GB total, %.1f GB available" % (total / GB, avail / GB))
+        print("load: %.2f %.2f %.2f (1/5/15 min; wait above %.1f)" % (load + (float(cfg["loadFactor"]) * cores,)))
+        print("disk: %.1f GB free" % (disk / GB))
+        for kind, h in heavy.items():
+            print("heavy.%s: %d running (slots: %d)" % (kind, h["running"], h["slots"]))
+        if verdict == "ok":
+            print("VERDICT: ok max_heavy=%d max_agents=%d" % (max_heavy, max_agents))
+        else:
+            print("VERDICT: wait reason=%s" % ",".join(reasons))
+    return 3 if reasons else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

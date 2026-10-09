@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""jsp-config - read the per-project jamie-superpowers config.
+
+Usage:
+  jsp-config get [<dotted.key> [default]]   value (JSON for objects/lists, text for scalars)
+  jsp-config path                           config file location (exit 1 if it does not exist)
+  jsp-config root                           project root (holds the config and .jamie-superpowers/)
+  jsp-config repos                          absolute repo paths, one per line
+
+Config file: <project root>/.jamie-superpowers.json (all keys optional; defaults are
+merged in). `get` with a missing key prints the default (or nothing, exit 1).
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+
+def main(argv):
+    if not argv or J.wants_help(argv):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    root = J.project_root()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "path":
+        p = J.config_path(root)
+        print(p)
+        return 0 if os.path.isfile(p) else 1
+    if cmd == "root":
+        print(root)
+        return 0
+    try:
+        cfg = J.load_config(root)
+    except J.ConfigError as e:
+        J.die(str(e))
+    if cmd == "repos":
+        print("\n".join(J.repo_paths(root, cfg)))
+        return 0
+    if cmd == "get":
+        if not rest:
+            print(J.fmt(cfg))
+            return 0
+        found, value = J.dotted_get(cfg, rest[0])
+        if found:
+            print(J.fmt(value))
+            return 0
+        if len(rest) > 1:
+            print(rest[1])
+            return 0
+        return 1
+    J.die("unknown command: %s (see --help)" % cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

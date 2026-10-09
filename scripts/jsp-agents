@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""jsp-agents - ledger of dispatched sub-agents, to decide resume vs fresh start.
+
+Usage:
+  jsp-agents log <id> <model> <description...>   record a new agent
+  jsp-agents touch <id>                          record activity (e.g. after SendMessage)
+  jsp-agents done <id>                           mark finished
+  jsp-agents list [--all]                        open agents of this project (--all: every project)
+  jsp-agents check <id>                          prints "warm <min>" (exit 0) or "cold <min>" (exit 2)
+
+Append-only events (JSON lines with UTC timestamps and project root) in
+${JSP_HOME:-$HOME/.claude/jamie-superpowers}/agents.jsonl. An agent is COLD when its last
+activity is older than cacheResumeMinutes (project config, default 45): the prompt cache has
+expired, so resuming costs about as much as a fresh agent with a short brief.
+Exit 1 for an unknown id.
+"""
+import datetime
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+
+def ledger():
+    return os.path.join(J.user_home(), "agents.jsonl")
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def append(event, agent_id, root, **extra):
+    rec = {"ts": now().strftime("%Y-%m-%dT%H:%M:%SZ"), "event": event, "id": agent_id, "project": root}
+    rec.update(extra)
+    os.makedirs(J.user_home(), exist_ok=True)
+    with open(ledger(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def load():
+    """Fold events into {id: state}."""
+    agents = {}
+    try:
+        f = open(ledger(), encoding="utf-8")
+    except OSError:
+        return agents
+    with f:
+        for line in f:
+            try:
+                e = json.loads(line)
+                ts = datetime.datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+                a = agents.setdefault(e["id"], {"id": e["id"], "model": "?", "desc": "", "done": False})
+            except (ValueError, KeyError, TypeError):
+                continue
+            a["last"] = ts
+            a["project"] = e.get("project", a.get("project", ""))
+            if e["event"] == "log":
+                a.update(model=e.get("model", "?"), desc=e.get("desc", ""), done=False)
+            elif e["event"] == "done":
+                a["done"] = True
+    return agents
+
+
+def minutes_since(a):
+    return int((now() - a["last"]).total_seconds() // 60)
+
+
+def main(argv):
+    if not argv or J.wants_help(argv):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    root = J.project_root()
+    cfg = J.load_config_safe(root)
+    cold_after = float(cfg["cacheResumeMinutes"])
+
+    if cmd == "log":
+        if len(rest) < 3:
+            J.die("usage: jsp-agents log <id> <model> <description...>")
+        append("log", rest[0], root, model=rest[1], desc=" ".join(rest[2:])[:200])
+        return 0
+    if cmd in ("touch", "done", "check"):
+        if len(rest) != 1:
+            J.die("usage: jsp-agents %s <id>" % cmd)
+        agents = load()
+        a = agents.get(rest[0])
+        if cmd == "check":
+            if not a:
+                print("unknown")
+                return 1
+            m = minutes_since(a)
+            cold = m > cold_after
+            print("%s %d" % ("cold" if cold else "warm", m))
+            return 2 if cold else 0
+        append(cmd, rest[0], root)
+        return 0
+    if cmd == "list":
+        show_all = "--all" in rest
+        rows = [a for a in load().values() if not a["done"] and (show_all or a.get("project") == root)]
+        if not rows:
+            print("no open agents")
+            return 0
+        for a in sorted(rows, key=lambda a: a["last"]):
+            m = minutes_since(a)
+            print("%-14s %-8s %4d min  %s  %s" % (a["id"], a["model"], m, "COLD" if m > cold_after else "warm", a["desc"]))
+        return 0
+    J.die("unknown command: %s (see --help)" % cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

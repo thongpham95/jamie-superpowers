@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""neutrality-lint - make sure the plugin carries nothing personal or project specific.
+
+Usage: neutrality-lint [path]        (default: the plugin root)
+
+Flags, as file:line hits (exit 1 if any, 0 if clean):
+  - personal paths (/Users/<name>, /home/<name>)
+  - email addresses (except noreply@, git@, and anything in LICENSE / NOTICE files)
+  - common secret formats (sk-, ghp_, AKIA, private-key blocks)
+  - every non-empty, non-# line of the user denylist (case-insensitive substring), matched
+    against file contents and file names:
+    ${JSP_HOME:-$HOME/.claude/jamie-superpowers}/denylist.txt
+Skips .git, node_modules, .DS_Store and binary files. Matched secrets are never printed.
+"""
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import jsplib as J  # noqa: E402
+
+PATTERNS = [
+    ("personal path", re.compile(r"/Users/[A-Za-z]|/home/[a-z]")),
+    ("email", re.compile(r"(?<![A-Za-z0-9._%+-])(?!noreply@|git@)[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")),
+    ("secret", re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----" + "BEGIN")),
+]
+SKIP_DIRS = {".git", "node_modules"}
+EMAIL_EXEMPT = re.compile(r"^(LICENSE|NOTICE)", re.I)
+
+
+def denylist():
+    path = os.path.join(J.user_home(), "denylist.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [l.strip().lower() for l in f if l.strip() and not l.lstrip().startswith("#")], path
+    except OSError:
+        return [], path
+
+
+def main(argv):
+    if J.wants_help(argv):
+        print(__doc__.strip())
+        return 0
+    default_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    target = os.path.realpath(argv[0] if argv else default_root)
+    deny, deny_path = denylist()
+    hits = 0
+
+    def hit(rel, line, what):
+        nonlocal hits
+        hits += 1
+        print("%s:%s: %s" % (rel, line, what))
+
+    for dirpath, dirs, files in os.walk(target):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for name in sorted(files):
+            full = os.path.join(dirpath, name)
+            if name == ".DS_Store" or os.path.realpath(full) == os.path.realpath(deny_path):
+                continue
+            rel = os.path.relpath(full, target)
+            for w in deny:
+                if w in rel.lower():
+                    hit(rel, 0, "denylist term in file name")
+            try:
+                with open(full, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if b"\0" in data[:4096]:
+                continue
+            for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+                low = line.lower()
+                for label, rx in PATTERNS:
+                    if label == "email" and EMAIL_EXEMPT.match(name):
+                        continue
+                    if rx.search(line):
+                        hit(rel, n, label)
+                for w in deny:
+                    if w in low:
+                        hit(rel, n, "denylist entry #%d" % (deny.index(w) + 1))
+    print("neutrality-lint: %d hit(s) in %s" % (hits, target), file=sys.stderr)
+    return 1 if hits else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
