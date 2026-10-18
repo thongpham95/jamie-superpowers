@@ -31,7 +31,7 @@ Process skills come first — they set the approach, then implementation skills 
 - "Fix this bug" → jamie-superpowers:systematic-debugging first, then domain skills.
 - 2+ independent tasks → jamie-superpowers:resource-budget, then jamie-superpowers:dispatching-parallel-agents.
 - Sending more work to an existing subagent → jamie-superpowers:cache-aware-dispatch first.
-- A batch of agents merged → jamie-superpowers:batch-cleanup. A deploy finished → jamie-superpowers:deploy-changelog. Pushed → jamie-superpowers:ci-watch.
+- A release, a merged worktree, a batch of agents merged, or a change that looks stable → jamie-superpowers:batch-cleanup. A deploy finished → jamie-superpowers:deploy-changelog. Pushed → jamie-superpowers:ci-watch.
 - Long session, a milestone, or pausing → jamie-superpowers:context-keeper and jamie-superpowers:session-handoff.
 
 ## Operating Rules (always on)
@@ -57,7 +57,7 @@ Use Fable without asking for: reviews of diffs touching the project's `sensitive
 
 **6. Context.** Keep the main context lean (context-keeper). Update the handoff at milestones (session-handoff). The PreCompact hook writes a checkpoint; after compaction, the session-start context points to it — read it before continuing.
 
-**7. Reporting.** After every deploy: changelog in chat (deploy-changelog). After every batch: cleanup report with disk freed (batch-cleanup). Verify claims from diffs and command output, never from a subagent's self-report alone.
+**7. Reporting.** After every deploy: changelog in chat (deploy-changelog). After every release, merge or batch: cleanup report with disk freed (batch-cleanup). Verify claims from diffs and command output, never from a subagent's self-report alone.
 
 ## Red Flags
 

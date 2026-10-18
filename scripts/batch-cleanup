@@ -11,6 +11,10 @@ Only what the project config lists is touched beyond that:
   - cleanup.dockerImages   globs on repo:tag; images used by no container -> docker rmi
   - cleanup.dockerVolumes  globs; dangling volumes only -> docker volume rm
   - cleanup.tmpGlobs       absolute globs; paths owned by the current user
+  - cleanup.dirs           regenerable build output (build dirs, derived-data, archives): a list of
+                           {"glob": "...", "minAgeMinutes": 30, "ask": false}; relative globs are taken
+                           inside every repo, absolute/~ globs as given. Skipped while a configured heavy
+                           job runs, or when newer than minAgeMinutes. "ask": true only lists the path.
 Prints REMOVE / WOULD REMOVE / KEEP <thing>: <reason> lines, then the disk freed and the
 free disk. Docker steps are skipped when the CLI or daemon is unavailable.
 """
@@ -208,6 +212,63 @@ def cleanup_tmp(cfg, apply, cwd):
                     say("KEEP", p, str(e))
 
 
+def running_commands():
+    rc, out, _ = J.run(["ps", "-axo", "command"])
+    return out if rc == 0 else ""
+
+
+def cleanup_dirs(cfg, root, repos, apply, cwd):
+    """Regenerable build output named by the project config. Never the repo root, home or filesystem root."""
+    global freed
+    entries = cfg["cleanup"].get("dirs") or []
+    if not entries:
+        return
+    busy_needles = [m for job in cfg.get("heavyJobs", {}).values() for m in job.get("match", [])]
+    procs = running_commands()
+    home = os.path.expanduser("~")
+    protected = {"/", home, os.path.realpath(root)} | {os.path.realpath(r) for r in repos}
+    for entry in entries:
+        if isinstance(entry, str):
+            entry = {"glob": entry}
+        pattern = os.path.expanduser(entry.get("glob", ""))
+        if not pattern:
+            continue
+        min_age = float(entry.get("minAgeMinutes", 30)) * 60
+        ask = bool(entry.get("ask", False))
+        bases = [""] if os.path.isabs(pattern) else repos
+        for base in bases:
+            for p in sorted(glob.glob(os.path.join(base, pattern) if base else pattern)):
+                real = os.path.realpath(p)
+                if real in protected or any(real == q or q.startswith(real + os.sep) for q in protected) \
+                        or cwd == real or cwd.startswith(real + os.sep):
+                    say("KEEP", p, "protected (repo root, home, or contains the current directory)")
+                    continue
+                if os.lstat(p).st_uid != os.geteuid():
+                    say("KEEP", p, "not owned by current user")
+                    continue
+                if time.time() - os.path.getmtime(p) < min_age:
+                    say("KEEP", p, "touched < %d min ago" % (min_age // 60))
+                    continue
+                size = du(p)
+                if ask:
+                    say("ASK", p, "%d MB; the project asks the user before removing this" % (size // 1048576))
+                elif any(n and n in procs for n in busy_needles):
+                    say("KEEP", p, "a heavy job (build/test) is running; not touching build output now")
+                elif not apply:
+                    say("WOULD REMOVE", p)
+                    freed += size
+                else:
+                    try:
+                        if os.path.isdir(p) and not os.path.islink(p):
+                            shutil.rmtree(p)
+                        else:
+                            os.unlink(p)
+                        freed += size
+                        say("REMOVED", p)
+                    except OSError as e:
+                        say("KEEP", p, str(e))
+
+
 def main(argv):
     if J.wants_help(argv):
         print(__doc__.strip())
@@ -222,11 +283,14 @@ def main(argv):
     print("batch-cleanup (%s) in %s" % ("APPLY" if apply else "dry run, nothing removed", root))
     if not os.path.isfile(J.config_path(root)):
         say("KEEP", "docker/tmp", "no project config: only merged clean worktrees are considered")
+    repos = []
     for repo in J.repo_paths(root, cfg):
         if not os.path.exists(os.path.join(repo, ".git")):
             say("KEEP", "repo " + repo, "not a git repository")
             continue
+        repos.append(repo)
         cleanup_worktrees(repo, apply, cwd)
+    cleanup_dirs(cfg, root, repos, apply, cwd)
     cleanup_docker(cfg, apply)
     cleanup_tmp(cfg, apply, cwd)
     print("%s: %.2f GB (%d MB)" % ("Freed" if apply else "Would free", freed / GB, freed // 1048576))

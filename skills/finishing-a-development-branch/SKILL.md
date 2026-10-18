@@ -204,7 +204,7 @@ place. If your platform provides a workspace-exit tool, use it.
 
 1. **Consent:** merging or pushing to a branch that auto-deploys is a deploy. Ask first (using-jamie-superpowers rule 4).
 2. **CI:** after any push, follow ci-watch until green. The branch is not finished while CI is red.
-3. **Cleanup:** run batch-cleanup (dry run, then apply) and report the space freed.
+3. **Cleanup:** run batch-cleanup (dry run, then apply) right after every merge or release, hand-check the "Beyond the Script" items, and report the space freed.
 4. **Changelog:** if the merge deployed anything, run deploy-changelog.
 5. **Handoff:** update the handoff and memory (session-handoff).
 

@@ -11,7 +11,7 @@ STATE_NAME = ".jamie-superpowers"
 DEFAULTS = {
     "heavyJobs": {},
     "loadFactor": 1.5,
-    "cleanup": {"dockerImages": [], "dockerVolumes": [], "tmpGlobs": []},
+    "cleanup": {"dockerImages": [], "dockerVolumes": [], "tmpGlobs": [], "dirs": []},
     "needsConsent": [],
     "sensitivePaths": [],
     "handoffDir": ".",

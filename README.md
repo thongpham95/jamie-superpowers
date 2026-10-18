@@ -70,6 +70,7 @@ Every key is optional.
 | `heavyJobs.<kind>.slots` / `.match` | none / 1 slot | Concurrency slots per kind of heavy job; `match` are process command-line substrings counted by `machine-budget` |
 | `loadFactor` | 1.5 | `machine-budget` says wait when load1 exceeds `loadFactor x cores` |
 | `cleanup.dockerImages` / `dockerVolumes` / `tmpGlobs` | empty | The only Docker/temp things `batch-cleanup` may remove |
+| `cleanup.dirs` | empty | Regenerable build output `batch-cleanup` may remove: `{glob, minAgeMinutes, ask}`; relative globs apply inside each repo; skipped while a heavy job runs; `ask: true` only lists |
 | `needsConsent` | empty | Command substrings the skills treat as needing explicit user consent |
 | `sensitivePaths` | empty | Globs the skills treat as never to be printed or committed |
 | `handoffDir`, `handoffGlob` | `.`, `HANDOFF-*.md` | Where the session-start hook looks for the newest handoff file |
@@ -98,7 +99,7 @@ All accept `--help`.
 | `jsp-pref get\|set\|unset <key> [value]` | User preferences |
 | `machine-budget [--json]` | Cores, RAM, load, disk, heavy processes; ends with `VERDICT: ok max_heavy=N max_agents=N` or `VERDICT: wait reason=...` (exit 3) |
 | `jsp-slot <kind> -- <cmd...>` / `status` | Run a heavy command inside a per-kind slot; waits while slots are busy or the machine is loaded |
-| `batch-cleanup [--apply]` | Dry run by default; removes merged clean worktrees and branches, plus only the configured Docker/temp items |
+| `batch-cleanup [--apply]` | Dry run by default; removes merged clean worktrees and branches, plus only the configured Docker/temp/build-output items |
 | `jsp-agents log\|touch\|done\|list\|check` | Ledger of dispatched agents; `check` returns warm (0) or cold (2) |
 | `changes-since <ref>` | Markdown changelog skeleton grouped by commit type |
 | `neutrality-lint [path]` | Fails on personal paths, emails, secrets and denylist terms |
